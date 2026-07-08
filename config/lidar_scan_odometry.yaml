@@ -1,0 +1,20 @@
+lidar_scan_odometry_node:
+  ros__parameters:
+    scan_topic: /scan
+    odom_topic: /lidar/odom
+
+    odom_frame: odom
+    base_frame: base_link
+
+    min_range: 0.10
+    max_range: 12.0
+    max_points: 500
+
+    icp_iterations: 10
+    max_correspondence_distance: 0.35
+
+    max_translation_per_scan: 0.50
+    max_rotation_per_scan: 0.50
+
+    xy_covariance: 0.05
+    yaw_covariance: 0.05

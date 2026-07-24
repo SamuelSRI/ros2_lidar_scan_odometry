@@ -308,9 +308,9 @@ private:
 
     // Le transform calculé aligne current -> previous.
     // Le mouvement du robot est previous -> current, donc on inverse.
-    dx = -total_x;
-    dy = -total_y;
-    dyaw = -total_yaw;
+    dx = total_x;
+    dy = total_y;
+    dyaw = total_yaw;
 
     return true;
   }

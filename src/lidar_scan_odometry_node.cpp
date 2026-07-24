@@ -1,18 +1,37 @@
+#include <algorithm>
 #include <cmath>
+#include <cstddef>
+#include <deque>
+#include <functional>
 #include <limits>
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
+#include "builtin_interfaces/msg/time.hpp"
+#include "geometry_msgs/msg/quaternion.hpp"
+#include "nav_msgs/msg/odometry.hpp"
 #include "rclcpp/rclcpp.hpp"
 #include "sensor_msgs/msg/laser_scan.hpp"
-#include "nav_msgs/msg/odometry.hpp"
-#include "geometry_msgs/msg/quaternion.hpp"
 
 struct Point2D
 {
-  double x;
-  double y;
+  double x{0.0};
+  double y{0.0};
+};
+
+struct Pose2D
+{
+  double x{0.0};
+  double y{0.0};
+  double yaw{0.0};
+};
+
+struct Keyframe
+{
+  Pose2D pose;
+  std::vector<Point2D> points_odom;
 };
 
 class LidarScanOdometryNode : public rclcpp::Node
@@ -21,40 +40,71 @@ public:
   LidarScanOdometryNode()
   : Node("lidar_scan_odometry_node")
   {
-    scan_topic_ = this->declare_parameter<std::string>("scan_topic", "/scan");
-    odom_topic_ = this->declare_parameter<std::string>("odom_topic", "/lidar/odom");
+    scan_topic_ = declare_parameter<std::string>("scan_topic", "/scan");
+    odom_topic_ = declare_parameter<std::string>("odom_topic", "/lidar/odom");
 
-    odom_frame_ = this->declare_parameter<std::string>("odom_frame", "odom");
-    base_frame_ = this->declare_parameter<std::string>("base_frame", "base_link");
+    odom_frame_ = declare_parameter<std::string>("odom_frame", "odom");
+    base_frame_ = declare_parameter<std::string>("base_frame", "base_link");
 
-    min_range_ = this->declare_parameter<double>("min_range", 0.10);
-    max_range_ = this->declare_parameter<double>("max_range", 12.0);
-    max_points_ = this->declare_parameter<int>("max_points", 500);
+    min_range_ = declare_parameter<double>("min_range", 0.10);
+    max_range_ = declare_parameter<double>("max_range", 12.0);
+    max_scan_points_ = declare_parameter<int>("max_scan_points", 500);
 
-    icp_iterations_ = this->declare_parameter<int>("icp_iterations", 10);
+    icp_iterations_ = declare_parameter<int>("icp_iterations", 20);
     max_correspondence_distance_ =
-      this->declare_parameter<double>("max_correspondence_distance", 0.35);
+      declare_parameter<double>("max_correspondence_distance", 0.40);
+    min_correspondences_ = declare_parameter<int>("min_correspondences", 40);
+    min_inlier_ratio_ = declare_parameter<double>("min_inlier_ratio", 0.25);
+    max_icp_rmse_ = declare_parameter<double>("max_icp_rmse", 0.20);
+    convergence_translation_ =
+      declare_parameter<double>("convergence_translation", 0.001);
+    convergence_rotation_ =
+      declare_parameter<double>("convergence_rotation", 0.001);
+
+    keyframe_translation_ =
+      declare_parameter<double>("keyframe_translation", 0.20);
+    keyframe_rotation_ =
+      declare_parameter<double>("keyframe_rotation", 0.15);
+    max_keyframes_ = declare_parameter<int>("max_keyframes", 15);
+
+    submap_voxel_size_ =
+      declare_parameter<double>("submap_voxel_size", 0.05);
+    max_submap_points_ =
+      declare_parameter<int>("max_submap_points", 2500);
 
     max_translation_per_scan_ =
-      this->declare_parameter<double>("max_translation_per_scan", 0.50);
+      declare_parameter<double>("max_translation_per_scan", 0.35);
     max_rotation_per_scan_ =
-      this->declare_parameter<double>("max_rotation_per_scan", 0.50);
+      declare_parameter<double>("max_rotation_per_scan", 0.35);
 
-    xy_covariance_ = this->declare_parameter<double>("xy_covariance", 0.05);
-    yaw_covariance_ = this->declare_parameter<double>("yaw_covariance", 0.05);
+    use_constant_velocity_prediction_ =
+      declare_parameter<bool>("use_constant_velocity_prediction", true);
 
-    odom_pub_ = this->create_publisher<nav_msgs::msg::Odometry>(odom_topic_, 10);
+    xy_covariance_ = declare_parameter<double>("xy_covariance", 0.03);
+    yaw_covariance_ = declare_parameter<double>("yaw_covariance", 0.03);
+    rejected_xy_covariance_ =
+      declare_parameter<double>("rejected_xy_covariance", 1.0);
+    rejected_yaw_covariance_ =
+      declare_parameter<double>("rejected_yaw_covariance", 1.0);
 
-    scan_sub_ = this->create_subscription<sensor_msgs::msg::LaserScan>(
+    odom_pub_ = create_publisher<nav_msgs::msg::Odometry>(odom_topic_, 10);
+
+    scan_sub_ = create_subscription<sensor_msgs::msg::LaserScan>(
       scan_topic_,
-      10,
-      std::bind(&LidarScanOdometryNode::scanCallback, this, std::placeholders::_1)
-    );
+      rclcpp::SensorDataQoS(),
+      std::bind(
+        &LidarScanOdometryNode::scanCallback,
+        this,
+        std::placeholders::_1));
 
-    RCLCPP_INFO(this->get_logger(), "LiDAR scan odometry node started");
-    RCLCPP_INFO(this->get_logger(), "Input scan topic: %s", scan_topic_.c_str());
-    RCLCPP_INFO(this->get_logger(), "Output odom topic: %s", odom_topic_.c_str());
-    RCLCPP_INFO(this->get_logger(), "This node publishes Odometry only, no TF");
+    RCLCPP_INFO(get_logger(), "LiDAR scan-to-submap odometry started");
+    RCLCPP_INFO(get_logger(), "Input:  %s", scan_topic_.c_str());
+    RCLCPP_INFO(get_logger(), "Output: %s", odom_topic_.c_str());
+    RCLCPP_INFO(
+      get_logger(),
+      "Local map: up to %d keyframes and %d points",
+      max_keyframes_,
+      max_submap_points_);
   }
 
 private:
@@ -65,25 +115,41 @@ private:
 
   double min_range_;
   double max_range_;
-  int max_points_;
+  int max_scan_points_;
 
   int icp_iterations_;
   double max_correspondence_distance_;
+  int min_correspondences_;
+  double min_inlier_ratio_;
+  double max_icp_rmse_;
+  double convergence_translation_;
+  double convergence_rotation_;
+
+  double keyframe_translation_;
+  double keyframe_rotation_;
+  int max_keyframes_;
+
+  double submap_voxel_size_;
+  int max_submap_points_;
 
   double max_translation_per_scan_;
   double max_rotation_per_scan_;
+  bool use_constant_velocity_prediction_;
 
   double xy_covariance_;
   double yaw_covariance_;
+  double rejected_xy_covariance_;
+  double rejected_yaw_covariance_;
 
-  bool has_previous_scan_ = false;
-
-  std::vector<Point2D> previous_points_;
+  bool initialized_{false};
+  Pose2D pose_;
+  Pose2D previous_pose_;
+  Pose2D last_motion_;
+  Pose2D last_keyframe_pose_;
   rclcpp::Time previous_stamp_;
 
-  double x_ = 0.0;
-  double y_ = 0.0;
-  double yaw_ = 0.0;
+  std::deque<Keyframe> keyframes_;
+  std::vector<Point2D> local_submap_;
 
   rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr odom_pub_;
   rclcpp::Subscription<sensor_msgs::msg::LaserScan>::SharedPtr scan_sub_;
@@ -98,93 +164,308 @@ private:
     geometry_msgs::msg::Quaternion q;
     q.x = 0.0;
     q.y = 0.0;
-    q.z = std::sin(yaw * 0.5);
-    q.w = std::cos(yaw * 0.5);
+    q.z = std::sin(0.5 * yaw);
+    q.w = std::cos(0.5 * yaw);
     return q;
   }
 
-  std::vector<Point2D> scanToPoints(const sensor_msgs::msg::LaserScan::SharedPtr scan)
+  static Point2D transformPoint(const Point2D & point, const Pose2D & pose)
+  {
+    const double c = std::cos(pose.yaw);
+    const double s = std::sin(pose.yaw);
+
+    return {
+      c * point.x - s * point.y + pose.x,
+      s * point.x + c * point.y + pose.y
+    };
+  }
+
+  static Pose2D compose(const Pose2D & first, const Pose2D & second)
+  {
+    // T_result = T_first * T_second
+    const double c = std::cos(first.yaw);
+    const double s = std::sin(first.yaw);
+
+    Pose2D result;
+    result.x = first.x + c * second.x - s * second.y;
+    result.y = first.y + s * second.x + c * second.y;
+    result.yaw = normalizeAngle(first.yaw + second.yaw);
+    return result;
+  }
+
+  static Pose2D inverse(const Pose2D & pose)
+  {
+    const double c = std::cos(pose.yaw);
+    const double s = std::sin(pose.yaw);
+
+    Pose2D result;
+    result.x = -c * pose.x - s * pose.y;
+    result.y = s * pose.x - c * pose.y;
+    result.yaw = normalizeAngle(-pose.yaw);
+    return result;
+  }
+
+  static Pose2D relativePose(const Pose2D & from, const Pose2D & to)
+  {
+    return compose(inverse(from), to);
+  }
+
+  std::vector<Point2D> scanToPoints(
+    const sensor_msgs::msg::LaserScan::SharedPtr & scan) const
   {
     std::vector<Point2D> points;
     points.reserve(scan->ranges.size());
 
     double angle = scan->angle_min;
 
-    for (const auto & r_float : scan->ranges) {
-      const double r = static_cast<double>(r_float);
+    for (const float range_float : scan->ranges) {
+      const double range = static_cast<double>(range_float);
 
-      if (std::isfinite(r) && r >= min_range_ && r <= max_range_) {
-        Point2D p;
-        p.x = r * std::cos(angle);
-        p.y = r * std::sin(angle);
-        points.push_back(p);
+      if (
+        std::isfinite(range) &&
+        range >= min_range_ &&
+        range <= max_range_)
+      {
+        points.push_back({
+          range * std::cos(angle),
+          range * std::sin(angle)
+        });
       }
 
       angle += scan->angle_increment;
     }
 
-    if (static_cast<int>(points.size()) <= max_points_) {
+    if (
+      max_scan_points_ <= 0 ||
+      static_cast<int>(points.size()) <= max_scan_points_)
+    {
       return points;
     }
 
     std::vector<Point2D> downsampled;
-    downsampled.reserve(max_points_);
+    downsampled.reserve(static_cast<std::size_t>(max_scan_points_));
 
-    const double step = static_cast<double>(points.size() - 1) /
-                        static_cast<double>(max_points_ - 1);
+    const double step =
+      static_cast<double>(points.size() - 1) /
+      static_cast<double>(max_scan_points_ - 1);
 
-    for (int i = 0; i < max_points_; ++i) {
-      const int index = static_cast<int>(std::round(i * step));
+    for (int i = 0; i < max_scan_points_; ++i) {
+      const auto index = static_cast<std::size_t>(
+        std::llround(static_cast<double>(i) * step));
       downsampled.push_back(points[index]);
     }
 
     return downsampled;
   }
 
+  std::vector<Point2D> transformCloud(
+    const std::vector<Point2D> & points,
+    const Pose2D & pose) const
+  {
+    std::vector<Point2D> transformed;
+    transformed.reserve(points.size());
+
+    for (const auto & point : points) {
+      transformed.push_back(transformPoint(point, pose));
+    }
+
+    return transformed;
+  }
+
+  std::vector<Point2D> voxelDownsample(
+    const std::vector<Point2D> & points,
+    double voxel_size,
+    int maximum_points) const
+  {
+    if (points.empty()) {
+      return {};
+    }
+
+    if (voxel_size <= 0.0) {
+      return uniformDownsample(points, maximum_points);
+    }
+
+    struct IndexedPoint
+    {
+      long long ix;
+      long long iy;
+      Point2D point;
+    };
+
+    std::vector<IndexedPoint> indexed;
+    indexed.reserve(points.size());
+
+    for (const auto & point : points) {
+      indexed.push_back({
+        static_cast<long long>(std::floor(point.x / voxel_size)),
+        static_cast<long long>(std::floor(point.y / voxel_size)),
+        point
+      });
+    }
+
+    std::sort(
+      indexed.begin(),
+      indexed.end(),
+      [](const IndexedPoint & a, const IndexedPoint & b) {
+        if (a.ix != b.ix) {
+          return a.ix < b.ix;
+        }
+        return a.iy < b.iy;
+      });
+
+    std::vector<Point2D> filtered;
+    filtered.reserve(indexed.size());
+
+    std::size_t begin = 0;
+    while (begin < indexed.size()) {
+      std::size_t end = begin + 1;
+      double sum_x = indexed[begin].point.x;
+      double sum_y = indexed[begin].point.y;
+
+      while (
+        end < indexed.size() &&
+        indexed[end].ix == indexed[begin].ix &&
+        indexed[end].iy == indexed[begin].iy)
+      {
+        sum_x += indexed[end].point.x;
+        sum_y += indexed[end].point.y;
+        ++end;
+      }
+
+      const double count = static_cast<double>(end - begin);
+      filtered.push_back({sum_x / count, sum_y / count});
+      begin = end;
+    }
+
+    return uniformDownsample(filtered, maximum_points);
+  }
+
+  static std::vector<Point2D> uniformDownsample(
+    const std::vector<Point2D> & points,
+    int maximum_points)
+  {
+    if (
+      maximum_points <= 0 ||
+      static_cast<int>(points.size()) <= maximum_points)
+    {
+      return points;
+    }
+
+    std::vector<Point2D> result;
+    result.reserve(static_cast<std::size_t>(maximum_points));
+
+    const double step =
+      static_cast<double>(points.size() - 1) /
+      static_cast<double>(maximum_points - 1);
+
+    for (int i = 0; i < maximum_points; ++i) {
+      const auto index = static_cast<std::size_t>(
+        std::llround(static_cast<double>(i) * step));
+      result.push_back(points[index]);
+    }
+
+    return result;
+  }
+
   bool findCorrespondences(
     const std::vector<Point2D> & source,
     const std::vector<Point2D> & target,
     std::vector<Point2D> & matched_source,
-    std::vector<Point2D> & matched_target)
+    std::vector<Point2D> & matched_target,
+    double & rmse,
+    double & inlier_ratio) const
   {
-    matched_source.clear();
-    matched_target.clear();
+    struct Match
+    {
+      Point2D source;
+      Point2D target;
+      double squared_distance;
+    };
 
-    const double max_dist_sq =
+    std::vector<Match> matches;
+    matches.reserve(source.size());
+
+    const double max_distance_squared =
       max_correspondence_distance_ * max_correspondence_distance_;
 
-    for (const auto & p : source) {
-      double best_dist_sq = std::numeric_limits<double>::max();
+    for (const auto & source_point : source) {
+      double best_squared_distance = std::numeric_limits<double>::max();
       std::size_t best_index = 0;
 
       for (std::size_t i = 0; i < target.size(); ++i) {
-        const double dx = target[i].x - p.x;
-        const double dy = target[i].y - p.y;
-        const double dist_sq = dx * dx + dy * dy;
+        const double dx = target[i].x - source_point.x;
+        const double dy = target[i].y - source_point.y;
+        const double squared_distance = dx * dx + dy * dy;
 
-        if (dist_sq < best_dist_sq) {
-          best_dist_sq = dist_sq;
+        if (squared_distance < best_squared_distance) {
+          best_squared_distance = squared_distance;
           best_index = i;
         }
       }
 
-      if (best_dist_sq <= max_dist_sq) {
-        matched_source.push_back(p);
-        matched_target.push_back(target[best_index]);
+      if (best_squared_distance <= max_distance_squared) {
+        matches.push_back({
+          source_point,
+          target[best_index],
+          best_squared_distance
+        });
       }
     }
 
-    return matched_source.size() >= 10;
+    inlier_ratio =
+      source.empty() ?
+      0.0 :
+      static_cast<double>(matches.size()) /
+      static_cast<double>(source.size());
+
+    if (
+      static_cast<int>(matches.size()) < min_correspondences_ ||
+      inlier_ratio < min_inlier_ratio_)
+    {
+      return false;
+    }
+
+    // Enlève les 20 % de correspondances les plus mauvaises.
+    std::sort(
+      matches.begin(),
+      matches.end(),
+      [](const Match & a, const Match & b) {
+        return a.squared_distance < b.squared_distance;
+      });
+
+    const std::size_t kept_count = std::max<std::size_t>(
+      static_cast<std::size_t>(min_correspondences_),
+      static_cast<std::size_t>(
+        std::floor(0.80 * static_cast<double>(matches.size()))));
+
+    matched_source.clear();
+    matched_target.clear();
+    matched_source.reserve(kept_count);
+    matched_target.reserve(kept_count);
+
+    double squared_error_sum = 0.0;
+
+    for (std::size_t i = 0; i < kept_count; ++i) {
+      matched_source.push_back(matches[i].source);
+      matched_target.push_back(matches[i].target);
+      squared_error_sum += matches[i].squared_distance;
+    }
+
+    rmse = std::sqrt(
+      squared_error_sum / static_cast<double>(kept_count));
+
+    return true;
   }
 
-  bool computeBestFitTransform(
+  static bool computeBestFitTransform(
     const std::vector<Point2D> & source,
     const std::vector<Point2D> & target,
-    double & delta_x,
-    double & delta_y,
-    double & delta_yaw)
+    Pose2D & transform)
   {
-    if (source.size() != target.size() || source.size() < 2) {
+    if (
+      source.size() != target.size() ||
+      source.size() < 2)
+    {
       return false;
     }
 
@@ -193,8 +474,6 @@ private:
     double target_cx = 0.0;
     double target_cy = 0.0;
 
-    const double n = static_cast<double>(source.size());
-
     for (std::size_t i = 0; i < source.size(); ++i) {
       source_cx += source[i].x;
       source_cy += source[i].y;
@@ -202,10 +481,11 @@ private:
       target_cy += target[i].y;
     }
 
-    source_cx /= n;
-    source_cy /= n;
-    target_cx /= n;
-    target_cy /= n;
+    const double count = static_cast<double>(source.size());
+    source_cx /= count;
+    source_cy /= count;
+    target_cx /= count;
+    target_cy /= count;
 
     double sxx = 0.0;
     double sxy = 0.0;
@@ -220,262 +500,355 @@ private:
       sxy += sx * ty - sy * tx;
     }
 
-    delta_yaw = std::atan2(sxy, sxx);
+    transform.yaw = std::atan2(sxy, sxx);
 
-    const double c = std::cos(delta_yaw);
-    const double s = std::sin(delta_yaw);
+    const double c = std::cos(transform.yaw);
+    const double s = std::sin(transform.yaw);
 
-    delta_x = target_cx - (c * source_cx - s * source_cy);
-    delta_y = target_cy - (s * source_cx + c * source_cy);
+    transform.x =
+      target_cx - (c * source_cx - s * source_cy);
+    transform.y =
+      target_cy - (s * source_cx + c * source_cy);
 
-    return true;
+    return
+      std::isfinite(transform.x) &&
+      std::isfinite(transform.y) &&
+      std::isfinite(transform.yaw);
   }
 
-  void applyTransform(
-    std::vector<Point2D> & points,
-    double dx,
-    double dy,
-    double dyaw)
+  bool alignScanToSubmap(
+    const std::vector<Point2D> & scan_points,
+    const Pose2D & predicted_pose,
+    Pose2D & estimated_pose,
+    double & final_rmse,
+    double & final_inlier_ratio) const
   {
-    const double c = std::cos(dyaw);
-    const double s = std::sin(dyaw);
-
-    for (auto & p : points) {
-      const double x_new = c * p.x - s * p.y + dx;
-      const double y_new = s * p.x + c * p.y + dy;
-
-      p.x = x_new;
-      p.y = y_new;
+    if (local_submap_.size() < static_cast<std::size_t>(min_correspondences_)) {
+      return false;
     }
-  }
 
-  bool icp2D(
-    const std::vector<Point2D> & current,
-    const std::vector<Point2D> & previous,
-    double & dx,
-    double & dy,
-    double & dyaw)
-  {
-    std::vector<Point2D> transformed = current;
+    // Le scan courant est d'abord placé dans odom avec une prédiction.
+    std::vector<Point2D> transformed_scan =
+      transformCloud(scan_points, predicted_pose);
 
-    double total_x = 0.0;
-    double total_y = 0.0;
-    double total_yaw = 0.0;
+    Pose2D total_correction;
 
-    for (int i = 0; i < icp_iterations_; ++i) {
+    final_rmse = std::numeric_limits<double>::infinity();
+    final_inlier_ratio = 0.0;
+
+    for (int iteration = 0; iteration < icp_iterations_; ++iteration) {
       std::vector<Point2D> matched_source;
       std::vector<Point2D> matched_target;
+      double rmse = 0.0;
+      double inlier_ratio = 0.0;
 
-      const bool correspondences_ok = findCorrespondences(
-        transformed,
-        previous,
-        matched_source,
-        matched_target
-      );
-
-      if (!correspondences_ok) {
+      if (!findCorrespondences(
+          transformed_scan,
+          local_submap_,
+          matched_source,
+          matched_target,
+          rmse,
+          inlier_ratio))
+      {
         return false;
       }
 
-      double step_x = 0.0;
-      double step_y = 0.0;
-      double step_yaw = 0.0;
-
-      const bool transform_ok = computeBestFitTransform(
-        matched_source,
-        matched_target,
-        step_x,
-        step_y,
-        step_yaw
-      );
-
-      if (!transform_ok) {
+      Pose2D correction;
+      if (!computeBestFitTransform(
+          matched_source,
+          matched_target,
+          correction))
+      {
         return false;
       }
 
-      applyTransform(transformed, step_x, step_y, step_yaw);
+      for (auto & point : transformed_scan) {
+        point = transformPoint(point, correction);
+      }
 
-      const double c = std::cos(step_yaw);
-      const double s = std::sin(step_yaw);
+      total_correction = compose(correction, total_correction);
+      final_rmse = rmse;
+      final_inlier_ratio = inlier_ratio;
 
-      const double new_total_x = c * total_x - s * total_y + step_x;
-      const double new_total_y = s * total_x + c * total_y + step_y;
+      const double correction_translation =
+        std::hypot(correction.x, correction.y);
 
-      total_x = new_total_x;
-      total_y = new_total_y;
-      total_yaw = normalizeAngle(total_yaw + step_yaw);
+      if (
+        correction_translation < convergence_translation_ &&
+        std::abs(correction.yaw) < convergence_rotation_)
+      {
+        break;
+      }
     }
 
-    // Le transform calculé aligne current -> previous.
-    // Le mouvement du robot est previous -> current, donc on inverse.
-    dx = total_x;
-    dy = total_y;
-    dyaw = total_yaw;
+    estimated_pose = compose(total_correction, predicted_pose);
 
-    return true;
+    return
+      std::isfinite(final_rmse) &&
+      final_rmse <= max_icp_rmse_ &&
+      final_inlier_ratio >= min_inlier_ratio_;
   }
 
-  void scanCallback(const sensor_msgs::msg::LaserScan::SharedPtr scan)
+  Pose2D predictPose() const
   {
-    const auto current_points = scanToPoints(scan);
+    if (!use_constant_velocity_prediction_) {
+      return pose_;
+    }
 
-    if (current_points.size() < 20) {
+    return compose(pose_, last_motion_);
+  }
+
+  bool motionIsPlausible(
+    const Pose2D & old_pose,
+    const Pose2D & new_pose,
+    Pose2D & relative_motion) const
+  {
+    relative_motion = relativePose(old_pose, new_pose);
+
+    const double translation =
+      std::hypot(relative_motion.x, relative_motion.y);
+
+    return
+      translation <= max_translation_per_scan_ &&
+      std::abs(relative_motion.yaw) <= max_rotation_per_scan_;
+  }
+
+  bool shouldCreateKeyframe(const Pose2D & current_pose) const
+  {
+    const Pose2D delta =
+      relativePose(last_keyframe_pose_, current_pose);
+
+    return
+      std::hypot(delta.x, delta.y) >= keyframe_translation_ ||
+      std::abs(delta.yaw) >= keyframe_rotation_;
+  }
+
+  void addKeyframe(
+    const std::vector<Point2D> & scan_points,
+    const Pose2D & keyframe_pose)
+  {
+    Keyframe keyframe;
+    keyframe.pose = keyframe_pose;
+    keyframe.points_odom = transformCloud(scan_points, keyframe_pose);
+
+    keyframes_.push_back(std::move(keyframe));
+
+    while (
+      max_keyframes_ > 0 &&
+      static_cast<int>(keyframes_.size()) > max_keyframes_)
+    {
+      keyframes_.pop_front();
+    }
+
+    last_keyframe_pose_ = keyframe_pose;
+    rebuildSubmap();
+  }
+
+  void rebuildSubmap()
+  {
+    std::vector<Point2D> all_points;
+
+    std::size_t total_size = 0;
+    for (const auto & keyframe : keyframes_) {
+      total_size += keyframe.points_odom.size();
+    }
+
+    all_points.reserve(total_size);
+
+    for (const auto & keyframe : keyframes_) {
+      all_points.insert(
+        all_points.end(),
+        keyframe.points_odom.begin(),
+        keyframe.points_odom.end());
+    }
+
+    local_submap_ = voxelDownsample(
+      all_points,
+      submap_voxel_size_,
+      max_submap_points_);
+
+    RCLCPP_DEBUG(
+      get_logger(),
+      "Submap rebuilt: %zu keyframes, %zu points",
+      keyframes_.size(),
+      local_submap_.size());
+  }
+
+  void scanCallback(
+    const sensor_msgs::msg::LaserScan::SharedPtr scan)
+  {
+    const std::vector<Point2D> current_points = scanToPoints(scan);
+
+    if (
+      current_points.size() <
+      static_cast<std::size_t>(min_correspondences_))
+    {
       RCLCPP_WARN_THROTTLE(
-        this->get_logger(),
-        *this->get_clock(),
+        get_logger(),
+        *get_clock(),
         2000,
-        "Not enough valid LiDAR points, skipping scan"
-      );
+        "Not enough valid LiDAR points: %zu",
+        current_points.size());
       return;
     }
 
     const rclcpp::Time current_stamp(scan->header.stamp);
 
-    if (!has_previous_scan_) {
-      previous_points_ = current_points;
+    if (!initialized_) {
+      pose_ = Pose2D{};
+      previous_pose_ = pose_;
+      last_motion_ = Pose2D{};
+      last_keyframe_pose_ = pose_;
       previous_stamp_ = current_stamp;
-      has_previous_scan_ = true;
 
-      publishOdometry(scan->header.stamp, 0.0, 0.0, 0.0);
+      addKeyframe(current_points, pose_);
+      initialized_ = true;
+
+      publishOdometry(
+        scan->header.stamp,
+        0.0,
+        0.0,
+        0.0,
+        xy_covariance_,
+        yaw_covariance_);
       return;
     }
 
-    double dx_local = 0.0;
-    double dy_local = 0.0;
-    double dyaw = 0.0;
+    const Pose2D predicted_pose = predictPose();
 
-    const bool icp_ok = icp2D(
+    Pose2D estimated_pose;
+    double rmse = 0.0;
+    double inlier_ratio = 0.0;
+
+    const bool icp_ok = alignScanToSubmap(
       current_points,
-      previous_points_,
-      dx_local,
-      dy_local,
-      dyaw
-    );
+      predicted_pose,
+      estimated_pose,
+      rmse,
+      inlier_ratio);
 
-    if (!icp_ok) {
+    Pose2D relative_motion;
+
+    if (
+      !icp_ok ||
+      !motionIsPlausible(pose_, estimated_pose, relative_motion))
+    {
       RCLCPP_WARN_THROTTLE(
-        this->get_logger(),
-        *this->get_clock(),
-        2000,
-        "ICP failed, keeping previous pose"
-      );
+        get_logger(),
+        *get_clock(),
+        1000,
+        "ICP rejected: rmse=%.3f m, inliers=%.1f%%",
+        rmse,
+        100.0 * inlier_ratio);
 
-      publishOdometry(scan->header.stamp, 0.0, 0.0, 0.0);
+      // On conserve la pose et on augmente la covariance.
+      publishOdometry(
+        scan->header.stamp,
+        0.0,
+        0.0,
+        0.0,
+        rejected_xy_covariance_,
+        rejected_yaw_covariance_);
       return;
     }
 
-    const double translation = std::sqrt(dx_local * dx_local + dy_local * dy_local);
-
-    if (translation > max_translation_per_scan_) {
-      RCLCPP_WARN(
-        this->get_logger(),
-        "Rejected LiDAR odom jump: translation = %.3f m",
-        translation
-      );
-
-      previous_points_ = current_points;
-      previous_stamp_ = current_stamp;
-      return;
-    }
-
-    if (std::abs(dyaw) > max_rotation_per_scan_) {
-      RCLCPP_WARN(
-        this->get_logger(),
-        "Rejected LiDAR odom jump: rotation = %.3f rad",
-        dyaw
-      );
-
-      previous_points_ = current_points;
-      previous_stamp_ = current_stamp;
-      return;
-    }
-
-    const double c = std::cos(yaw_);
-    const double s = std::sin(yaw_);
-
-    const double dx_global = c * dx_local - s * dy_local;
-    const double dy_global = s * dx_local + c * dy_local;
-
-    x_ += dx_global;
-    y_ += dy_global;
-    yaw_ = normalizeAngle(yaw_ + dyaw);
+    previous_pose_ = pose_;
+    pose_ = estimated_pose;
+    last_motion_ = relative_motion;
 
     double dt = (current_stamp - previous_stamp_).seconds();
-    if (dt <= 0.0) {
-      dt = 1e-6;
+    if (dt <= 0.0 || dt > 1.0) {
+      dt = 1e-3;
     }
 
-    const double vx = dx_local / dt;
-    const double vy = dy_local / dt;
-    const double wz = dyaw / dt;
+    const double vx = relative_motion.x / dt;
+    const double vy = relative_motion.y / dt;
+    const double wz = relative_motion.yaw / dt;
 
-    publishOdometry(scan->header.stamp, vx, vy, wz);
+    publishOdometry(
+      scan->header.stamp,
+      vx,
+      vy,
+      wz,
+      xy_covariance_,
+      yaw_covariance_);
 
-    previous_points_ = current_points;
     previous_stamp_ = current_stamp;
+
+    if (shouldCreateKeyframe(pose_)) {
+      addKeyframe(current_points, pose_);
+    }
+
+    RCLCPP_DEBUG(
+      get_logger(),
+      "pose=(%.3f, %.3f, %.3f), rmse=%.3f, inliers=%.1f%%",
+      pose_.x,
+      pose_.y,
+      pose_.yaw,
+      rmse,
+      100.0 * inlier_ratio);
   }
 
   void publishOdometry(
     const builtin_interfaces::msg::Time & stamp,
     double vx,
     double vy,
-    double wz)
+    double wz,
+    double xy_covariance,
+    double yaw_covariance)
   {
-    nav_msgs::msg::Odometry msg;
+    nav_msgs::msg::Odometry message;
 
-    msg.header.stamp = stamp;
-    msg.header.frame_id = odom_frame_;
-    msg.child_frame_id = base_frame_;
+    message.header.stamp = stamp;
+    message.header.frame_id = odom_frame_;
+    message.child_frame_id = base_frame_;
 
-    msg.pose.pose.position.x = x_;
-    msg.pose.pose.position.y = y_;
-    msg.pose.pose.position.z = 0.0;
-    msg.pose.pose.orientation = yawToQuaternion(yaw_);
+    message.pose.pose.position.x = pose_.x;
+    message.pose.pose.position.y = pose_.y;
+    message.pose.pose.position.z = 0.0;
+    message.pose.pose.orientation = yawToQuaternion(pose_.yaw);
 
-    msg.twist.twist.linear.x = vx;
-    msg.twist.twist.linear.y = vy;
-    msg.twist.twist.linear.z = 0.0;
+    message.twist.twist.linear.x = vx;
+    message.twist.twist.linear.y = vy;
+    message.twist.twist.linear.z = 0.0;
 
-    msg.twist.twist.angular.x = 0.0;
-    msg.twist.twist.angular.y = 0.0;
-    msg.twist.twist.angular.z = wz;
+    message.twist.twist.angular.x = 0.0;
+    message.twist.twist.angular.y = 0.0;
+    message.twist.twist.angular.z = wz;
 
-    for (auto & value : msg.pose.covariance) {
-      value = 0.0;
-    }
+    std::fill(
+      message.pose.covariance.begin(),
+      message.pose.covariance.end(),
+      0.0);
+    std::fill(
+      message.twist.covariance.begin(),
+      message.twist.covariance.end(),
+      0.0);
 
-    for (auto & value : msg.twist.covariance) {
-      value = 0.0;
-    }
+    message.pose.covariance[0] = xy_covariance;
+    message.pose.covariance[7] = xy_covariance;
+    message.pose.covariance[35] = yaw_covariance;
 
-    msg.pose.covariance[0] = xy_covariance_;
-    msg.pose.covariance[7] = xy_covariance_;
-    msg.pose.covariance[35] = yaw_covariance_;
+    message.pose.covariance[14] = 999.0;
+    message.pose.covariance[21] = 999.0;
+    message.pose.covariance[28] = 999.0;
 
-    msg.pose.covariance[14] = 999.0;
-    msg.pose.covariance[21] = 999.0;
-    msg.pose.covariance[28] = 999.0;
+    message.twist.covariance[0] = xy_covariance;
+    message.twist.covariance[7] = xy_covariance;
+    message.twist.covariance[35] = yaw_covariance;
 
-    msg.twist.covariance[0] = xy_covariance_;
-    msg.twist.covariance[7] = xy_covariance_;
-    msg.twist.covariance[35] = yaw_covariance_;
+    message.twist.covariance[14] = 999.0;
+    message.twist.covariance[21] = 999.0;
+    message.twist.covariance[28] = 999.0;
 
-    msg.twist.covariance[14] = 999.0;
-    msg.twist.covariance[21] = 999.0;
-    msg.twist.covariance[28] = 999.0;
-
-    odom_pub_->publish(msg);
+    odom_pub_->publish(message);
   }
 };
 
 int main(int argc, char ** argv)
 {
   rclcpp::init(argc, argv);
-
-  auto node = std::make_shared<LidarScanOdometryNode>();
-
-  rclcpp::spin(node);
-
+  rclcpp::spin(std::make_shared<LidarScanOdometryNode>());
   rclcpp::shutdown();
   return 0;
 }
